@@ -19,8 +19,7 @@ N_DEVICES = 4
 # * Dynamic race condition detection
 # * Uninitialized data is initially filled with NaN values
 #
-ENABLE_DEBUG = False
-
+ENABLE_DEBUG = True
 
 ################################################################################
 # Pallas RDMA helpers for convenience (already written)
@@ -184,8 +183,10 @@ def exchange_with_neighbor_pallas_scratch_specs(x):
     #   (example: `pltpu.SemaphoreType.REGULAR(shape=(2,))` for an array of 2 semaphores, or
     #   `pltpu.SemaphoreType.REGULAR` for a single semaphore)
     #
+    
+    shape = x.shape
     return {
-        # TODO: your code here
+        "dma_sems": pltpu.SemaphoreType.DMA(shape=(2,)),
     }
 
 
@@ -205,8 +206,34 @@ def exchange_with_neighbor_pallas_kernel(x_ref, out_ref, scratch_refs):
       `exchange_with_neighbor_pallas_scratch_specs`.
     """
 
-    # TODO: your code here
-    pass
+    # jax.debug.print("device {id}", id=pallas_get_my_device_id())
+
+    neighbor_id = pallas_get_my_device_id() ^ 1
+    # jax.debug.print("exchanging with device {neighbor_id}", neighbor_id=neighbor_id)
+
+    dma_sems = scratch_refs["dma_sems"]
+    src_sem = dma_sems.at[0]
+    dst_sem = dma_sems.at[1]
+
+    pallas_rdma_start(
+        src_ref=x_ref,
+        dst_ref=out_ref,
+        dst_device_id=neighbor_id,
+        src_send_sem=src_sem,
+        dst_recv_sem=dst_sem,
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=x_ref, 
+        src_send_sem=src_sem
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref, 
+        dst_recv_sem=dst_sem
+        )
+
+
+
 
 
 def reduce_scatter_pallas_scratch_specs(x):
