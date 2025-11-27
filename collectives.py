@@ -19,7 +19,7 @@ N_DEVICES = 4
 # * Dynamic race condition detection
 # * Uninitialized data is initially filled with NaN values
 #
-ENABLE_DEBUG = True
+ENABLE_DEBUG = False
 
 ################################################################################
 # Pallas RDMA helpers for convenience (already written)
@@ -39,7 +39,6 @@ def pallas_get_my_device_id():
     You *cannot* use the value anywhere a concrete Python `int` is required, such as to index into
     a Python list, or in control flow conditions like `if pallas_get_my_device_id() == 2: ...`.
     """
-
     return lax.axis_index(AXIS_NAME)
 
 
@@ -185,6 +184,7 @@ def exchange_with_neighbor_pallas_scratch_specs(x):
     #
     
     shape = x.shape
+    # jax.debug.print("shape: {shape}", shape=shape)
     return {
         "dma_sems": pltpu.SemaphoreType.DMA(shape=(2,)),
     }
@@ -234,8 +234,6 @@ def exchange_with_neighbor_pallas_kernel(x_ref, out_ref, scratch_refs):
 
 
 
-
-
 def reduce_scatter_pallas_scratch_specs(x):
     """
     Arguments:
@@ -245,8 +243,12 @@ def reduce_scatter_pallas_scratch_specs(x):
 
     # Works the same way as the earlier scratch specs function
     # (see `exchange_with_neighbor_pallas_scratch_specs` above)
+
+    num_rdmas = 3 # TODO: figure out actual num
     return {
-        # TODO: your code here
+        "vmem": pltpu.VMEM(shape=(x.shape[0] // 4, x.shape[1], x.shape[2]), dtype=x.dtype),
+        "src_dma_sems": pltpu.SemaphoreType.DMA(shape=(num_rdmas,)),
+        "dst_dma_sems": pltpu.SemaphoreType.DMA(shape=(num_rdmas,)),
     }
 
 
@@ -265,9 +267,38 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
       `reduce_scatter_pallas_scratch_specs`.
     """
 
-    # TODO: your code here
-    pass
+    id = pallas_get_my_device_id()
+    reduce_size = x_ref.shape[0] // 4
 
+    right_neighbor = (id + 1) % 4
+    # jax.debug.print("exchanging with device {neighbor_id}", neighbor_id=right_neighbor)
+
+    # send to right neighbor
+    src_sems = scratch_refs["src_dma_sems"]
+    dst_sems = scratch_refs["dst_dma_sems"]
+    vmem = scratch_refs["vmem"]
+
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(id * reduce_size, reduce_size)],
+        dst_ref=vmem,
+        dst_device_id=right_neighbor,
+        src_send_sem=src_sems.at[0],
+        dst_recv_sem=dst_sems.at[0]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(id * reduce_size, reduce_size)], 
+        src_send_sem=src_sems.at[0]
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=vmem, 
+        dst_recv_sem=dst_sems.at[0]
+        )
+    
+    # increment vmem with own 
+    vmem[pl.ds(0, reduce_size)] = x_ref[pl.ds(id * reduce_size, reduce_size)] + vmem[pl.ds(0, reduce_size)]
+
+    
 
 def all_gather_pallas_scratch_specs(x):
     """
@@ -278,8 +309,12 @@ def all_gather_pallas_scratch_specs(x):
 
     # Works the same way as the earlier scratch specs function
     # (see `exchange_with_neighbor_pallas_scratch_specs` above)
+    num_rdmas = 4 # TODO: figure out actual num
+
     return {
-        # TODO: your code here
+        # "vmem": pltpu.VMEM(shape=(x.shape[0] // 4, x.shape[1], x.shape[2]), dtype=x.dtype),
+        "src_dma_sems": pltpu.SemaphoreType.DMA(shape=(num_rdmas,)),
+        "dst_dma_sems": pltpu.SemaphoreType.DMA(shape=(num_rdmas,)),
     }
 
 
@@ -297,8 +332,99 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
       `all_gather_pallas_scratch_specs`.
     """
 
-    # TODO: your code here
-    pass
+    # tips from lab: reorder operations
+    id = pallas_get_my_device_id()
+    array_size = x_ref.shape[0]
+
+    src_sems = scratch_refs["src_dma_sems"]
+    dst_sems = scratch_refs["dst_dma_sems"]
+
+    out_ref[pl.ds(id*array_size, array_size)] = x_ref[pl.ds(0, array_size)]
+
+    # send to right neighbor
+    right_neighbor = (id + 1) % 4
+    left_neighbor = (id - 1) % 4
+
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(0, array_size)],
+        dst_ref=out_ref.at[pl.ds(id * array_size, array_size)],
+        dst_device_id=right_neighbor,
+        src_send_sem=src_sems.at[0],
+        dst_recv_sem=dst_sems.at[0]
+    )
+    # jax.debug.print("device {id} writing to right neighbor {right_neighbor} with offset {offset}",
+    #                  id=id, right_neighbor=right_neighbor, offset=id*array_size)
+    # jax.debug.print("device {id} reading from left neighbor {left_neighbor} with offset {offset}",
+    #                  id=id, left_neighbor=left_neighbor, offset=left_neighbor*array_size)
+    # and left
+    pallas_rdma_start(
+        src_ref=x_ref,
+        dst_ref=out_ref.at[pl.ds(id * array_size, array_size)],
+        dst_device_id=left_neighbor,
+        src_send_sem=src_sems.at[1],
+        dst_recv_sem=dst_sems.at[1]
+    )
+        
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(left_neighbor * array_size, array_size)],
+        dst_recv_sem=dst_sems.at[0]
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(right_neighbor * array_size, array_size)], 
+        dst_recv_sem=dst_sems.at[1]
+    )
+
+    # write missing tiles
+    missing = (id + 2) % 4
+    pallas_rdma_start(
+        src_ref=out_ref.at[pl.ds(right_neighbor * array_size, array_size // 2)],
+        dst_ref=out_ref.at[pl.ds(right_neighbor * array_size, array_size // 2)],
+        dst_device_id=left_neighbor,
+        src_send_sem=src_sems.at[2],
+        dst_recv_sem=dst_sems.at[2]
+    )
+    pallas_rdma_start(
+        src_ref=out_ref.at[pl.ds(left_neighbor * array_size + array_size//2, array_size // 2)],
+        dst_ref=out_ref.at[pl.ds(left_neighbor * array_size+ array_size//2, array_size // 2)],
+        dst_device_id=right_neighbor,
+        src_send_sem=src_sems.at[3],
+        dst_recv_sem=dst_sems.at[3]
+    )
+
+    # wait for all rdma reads
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(0, array_size)],
+        src_send_sem=src_sems.at[0]
+    )
+    pallas_rdma_wait_send(
+        src_ref=x_ref, 
+        src_send_sem=src_sems.at[1]
+    )
+    pallas_rdma_wait_send(
+        src_ref=out_ref.at[pl.ds(right_neighbor * array_size, array_size // 2)], 
+        src_send_sem=src_sems.at[2]
+    )
+    pallas_rdma_wait_send(
+        src_ref=out_ref.at[pl.ds(left_neighbor * array_size+ array_size//2, array_size // 2)], 
+        src_send_sem=src_sems.at[3]
+    )
+
+    # wait for second phase of rdmas to finish writing
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(missing * array_size, array_size // 2)], 
+        dst_recv_sem=dst_sems.at[2]
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(missing * array_size+ array_size//2, array_size // 2)], 
+        dst_recv_sem=dst_sems.at[3]
+    )
+
+
+
+
+
+
+
 
 
 ## <--- /your code here --->
