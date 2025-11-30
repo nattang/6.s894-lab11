@@ -41,7 +41,6 @@ def pallas_get_my_device_id():
     """
     return lax.axis_index(AXIS_NAME)
 
-
 def pallas_rdma_start(*, src_ref, dst_ref, dst_device_id, src_send_sem, dst_recv_sem):
     """
     During Pallas tracing, emits a Remote Direct Memory Access (RDMA) operation that asynchronously
@@ -95,7 +94,6 @@ def pallas_rdma_start(*, src_ref, dst_ref, dst_device_id, src_send_sem, dst_recv
         device_id_type=pltpu.DeviceIdType.LOGICAL,
     ).start()
 
-
 def pallas_rdma_wait_send(*, src_ref, src_send_sem):
     """
     During Pallas tracing, emits a wait for the "send" half of a previously-started RMDA operation
@@ -122,7 +120,6 @@ def pallas_rdma_wait_send(*, src_ref, src_send_sem):
         device_id=0,  # ignored by 'wait_send'
         device_id_type=pltpu.DeviceIdType.LOGICAL,
     ).wait_send()
-
 
 def pallas_rdma_wait_recv(*, dst_ref, dst_recv_sem):
     """
@@ -151,12 +148,10 @@ def pallas_rdma_wait_recv(*, dst_ref, dst_recv_sem):
         device_id_type=pltpu.DeviceIdType.LOGICAL,
     ).wait_recv()
 
-
 ################################################################################
 # Part 1: Implementing collectives in Pallas
 
 ## <--- your code here --->
-
 
 def exchange_with_neighbor_pallas_scratch_specs(x):
     """
@@ -233,7 +228,6 @@ def exchange_with_neighbor_pallas_kernel(x_ref, out_ref, scratch_refs):
         )
 
 
-
 def reduce_scatter_pallas_scratch_specs(x):
     """
     Arguments:
@@ -246,7 +240,9 @@ def reduce_scatter_pallas_scratch_specs(x):
 
     num_rdmas = 3 # TODO: figure out actual num
     return {
-        "vmem": pltpu.VMEM(shape=(x.shape[0] // 4, x.shape[1], x.shape[2]), dtype=x.dtype),
+        "right_vmem": pltpu.VMEM(shape=(x.shape[0] // 2, x.shape[1], x.shape[2]), dtype=x.dtype),
+        "left_vmem": pltpu.VMEM(shape=(x.shape[0] // 2, x.shape[1], x.shape[2]), dtype=x.dtype),
+
         "src_dma_sems": pltpu.SemaphoreType.DMA(shape=(num_rdmas,)),
         "dst_dma_sems": pltpu.SemaphoreType.DMA(shape=(num_rdmas,)),
     }
@@ -268,36 +264,137 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     """
 
     id = pallas_get_my_device_id()
-    reduce_size = x_ref.shape[0] // 4
+    array_size = x_ref.shape[0] // 4
+    shard_size = array_size // 2
 
-    right_neighbor = (id + 1) % 4
-    # jax.debug.print("exchanging with device {neighbor_id}", neighbor_id=right_neighbor)
-
-    # send to right neighbor
     src_sems = scratch_refs["src_dma_sems"]
     dst_sems = scratch_refs["dst_dma_sems"]
-    vmem = scratch_refs["vmem"]
+    right_vmem = scratch_refs["right_vmem"]
+    left_vmem = scratch_refs["left_vmem"]
 
+    # increment with own data
+    out_ref[pl.ds(0, array_size)] = x_ref[pl.ds(id*array_size, array_size)]
+
+    # send to right neighbor
+    right_neighbor = (id + 1) % 4
+    left_neighbor = (id - 1) % 4
+
+    #TODO: make dma indices more clear?
+    # split array in two, send as two rdmas to right neighbor
+
+    # note: sending bottom half first since we need it to send to the left neighbor
+
+    # jax.debug.print("device {id} sending with offset {offset}", id=id, offset=right_neighbor*array_size + shard_size)
     pallas_rdma_start(
-        src_ref=x_ref.at[pl.ds(id * reduce_size, reduce_size)],
-        dst_ref=vmem,
+        src_ref=x_ref.at[pl.ds(right_neighbor*array_size + shard_size, shard_size)],
+        dst_ref=right_vmem.at[pl.ds(shard_size, shard_size)], 
         dst_device_id=right_neighbor,
         src_send_sem=src_sems.at[0],
         dst_recv_sem=dst_sems.at[0]
     )
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(right_neighbor*array_size, shard_size)],
+        dst_ref=right_vmem.at[pl.ds(0, shard_size)],
+        dst_device_id=right_neighbor,
+        src_send_sem=src_sems.at[1],
+        dst_recv_sem=dst_sems.at[1]
+    )
 
+    # same for left neighbor
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(left_neighbor*array_size, shard_size)],
+        dst_ref=left_vmem.at[pl.ds(0, shard_size)],
+        dst_device_id=left_neighbor,
+        src_send_sem=src_sems.at[2],
+        dst_recv_sem=dst_sems.at[2]
+    )
+    # pallas_rdma_start(
+    #     src_ref=x_ref.at[pl.ds(left_neighbor * array_size + shard_size, shard_size)],
+    #     dst_ref=left_vmem.at[pl.ds(shard_size, shard_size)],
+    #     dst_device_id=left_neighbor,
+    #     src_send_sem=src_sems.at[3],
+    #     dst_recv_sem=dst_sems.at[3]
+    # )
+
+    # wait for the halves that need to be written to neighbors to be recieved
+    pallas_rdma_wait_recv(
+        dst_ref=right_vmem.at[pl.ds(shard_size, shard_size)], 
+        dst_recv_sem=dst_sems.at[0] # bottom half of rdma from right neighbor
+    )
+    out_ref[pl.ds(shard_size, shard_size)] = right_vmem[pl.ds(shard_size, shard_size)] + out_ref[pl.ds(shard_size, shard_size)]
+    
+    pallas_rdma_wait_recv(
+        dst_ref=left_vmem.at[pl.ds(left_neighbor * array_size, shard_size)], 
+        dst_recv_sem=dst_sems.at[2] # top half of rdma from left neighbor
+    )   
+    out_ref[pl.ds(0, shard_size)] =left_vmem[pl.ds(0, shard_size)] + out_ref[pl.ds(0, shard_size)]
+
+    # # # write missing tiles
+    # pallas_rdma_start(
+    #     src_ref=out_ref.at[pl.ds(left_neighbor * array_size, shard_size)],
+    #     dst_ref=out_ref.at[pl.ds(left_neighbor * array_size, shard_size)],
+    #     dst_device_id=right_neighbor,
+    #     src_send_sem=src_sems.at[4],
+    #     dst_recv_sem=dst_sems.at[4]
+    # )
+    # pallas_rdma_start(
+    #     src_ref=out_ref.at[pl.ds(right_neighbor * array_size + shard_size, shard_size)],
+    #     dst_ref=out_ref.at[pl.ds(right_neighbor * array_size + shard_size, shard_size)],
+    #     dst_device_id=left_neighbor,
+    #     src_send_sem=src_sems.at[5],
+    #     dst_recv_sem=dst_sems.at[5]
+    # )
+
+    # wait for all rdma reads
     pallas_rdma_wait_send(
-        src_ref=x_ref.at[pl.ds(id * reduce_size, reduce_size)], 
+        src_ref=x_ref.at[pl.ds(right_neighbor*array_size+shard_size, shard_size)], 
         src_send_sem=src_sems.at[0]
     )
-    pallas_rdma_wait_recv(
-        dst_ref=vmem, 
-        dst_recv_sem=dst_sems.at[0]
-        )
-    
-    # increment vmem with own 
-    vmem[pl.ds(0, reduce_size)] = x_ref[pl.ds(id * reduce_size, reduce_size)] + vmem[pl.ds(0, reduce_size)]
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(right_neighbor*array_size, shard_size)],
+        src_send_sem=src_sems.at[1]
+    )
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(left_neighbor*array_size, shard_size)], 
+        src_send_sem=src_sems.at[2]
+    )
+    # pallas_rdma_wait_send(
+    #     src_ref=x_ref.at[pl.ds(shard_size, shard_size)], 
+    #     src_send_sem=src_sems.at[3]
+    # )
 
+    # pallas_rdma_wait_send(
+    #     src_ref=out_ref.at[pl.ds(left_neighbor * array_size, shard_size)], 
+    #     src_send_sem=src_sems.at[4]
+    # )
+    # pallas_rdma_wait_send(
+    #     src_ref=out_ref.at[pl.ds(right_neighbor * array_size + shard_size, shard_size)], 
+    #     src_send_sem=src_sems.at[5]
+    # )
+
+
+    # wait for second phase of rdmas to finish writing
+    missing = (id + 2) % 4
+    pallas_rdma_wait_recv(
+        dst_ref=right_vmem.at[pl.ds(0, shard_size)], 
+        dst_recv_sem=dst_sems.at[1] # bottom half of rdma from right neighbor
+    )
+    out_ref[pl.ds(0, shard_size)] = right_vmem[pl.ds(0, shard_size)] + out_ref[pl.ds(0, shard_size)]
+
+    # pallas_rdma_wait_recv(
+    #     dst_ref=out_ref.at[pl.ds(left_neighbor * array_size + shard_size, shard_size)], 
+    #     dst_recv_sem=dst_sems.at[3] # top half of rdma from left neighbor
+    # )   
+    # pallas_rdma_wait_recv(
+    #     dst_ref=out_ref.at[pl.ds(missing * array_size, shard_size)], 
+    #     dst_recv_sem=dst_sems.at[4]
+    # )
+    # pallas_rdma_wait_recv(
+    #     dst_ref=out_ref.at[pl.ds(missing * array_size+ shard_size, shard_size)], 
+    #     dst_recv_sem=dst_sems.at[5]
+    # )
+
+    
     
 
 def all_gather_pallas_scratch_specs(x):
@@ -415,7 +512,6 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
         src_ref=x_ref.at[pl.ds(0, shard_size)],
         src_send_sem=src_sems.at[1]
     )
- 
     pallas_rdma_wait_send(
         src_ref=x_ref.at[pl.ds(0, shard_size)], 
         src_send_sem=src_sems.at[2]
@@ -453,9 +549,6 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
         dst_ref=out_ref.at[pl.ds(missing * array_size+ shard_size, shard_size)], 
         dst_recv_sem=dst_sems.at[5]
     )
-
-
-
 
 
 
