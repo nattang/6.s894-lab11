@@ -185,7 +185,8 @@ def exchange_with_neighbor_pallas_scratch_specs(x):
     #   `pltpu.SemaphoreType.REGULAR` for a single semaphore)
     #
     return {
-        # TODO: your code here
+        "send_sem" : pltpu.SemaphoreType.DMA,
+        "recv_sem" : pltpu.SemaphoreType.DMA,
     }
 
 
@@ -205,8 +206,34 @@ def exchange_with_neighbor_pallas_kernel(x_ref, out_ref, scratch_refs):
       `exchange_with_neighbor_pallas_scratch_specs`.
     """
 
-    # TODO: your code here
-    pass
+    # Get core ids
+    core_id = pallas_get_my_device_id()
+    neighbor_id = (core_id // 2) * 2 + (core_id + 1) % 2
+    
+    # Get Semaphores our of scratch specs
+    send_sems = scratch_refs["send_sem"]
+    recv_sems = scratch_refs["recv_sem"]
+
+    # Send data to neighbor
+    pallas_rdma_start(
+        src_ref=x_ref,
+        dst_ref=out_ref,
+        dst_device_id=neighbor_id,
+        src_send_sem=send_sems,
+        dst_recv_sem=recv_sems
+    )
+    
+    # Explicitly wait
+    pallas_rdma_wait_send(
+        src_ref=x_ref,
+        src_send_sem=send_sems
+    )
+    
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref,
+        dst_recv_sem=recv_sems
+    )
+
 
 
 def reduce_scatter_pallas_scratch_specs(x):
@@ -252,7 +279,8 @@ def all_gather_pallas_scratch_specs(x):
     # Works the same way as the earlier scratch specs function
     # (see `exchange_with_neighbor_pallas_scratch_specs` above)
     return {
-        # TODO: your code here
+        "send_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
+        "recv_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
     }
 
 
@@ -270,8 +298,83 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
       `all_gather_pallas_scratch_specs`.
     """
 
-    # TODO: your code here
-    pass
+    # Get core id
+    core_id = pallas_get_my_device_id()
+
+    # Get Semaphores
+    send_sems = scratch_refs["send_sems"]
+    recv_sems = scratch_refs["recv_sems"]
+
+    # Get size at trace time
+    size = x_ref.shape[0]
+
+    # Compute neighbor ids
+    left_neighbor  = (core_id - 1) % 4
+    right_neighbor = (core_id + 1) % 4
+
+    # Send data to left neighbor
+    pallas_rdma_start(
+        src_ref=x_ref,
+        dst_ref=out_ref.at[pl.ds(core_id*size, size)],
+        dst_device_id=left_neighbor,
+        src_send_sem=send_sems.at[0],
+        dst_recv_sem=recv_sems.at[0]
+    )
+
+    # Send data to right neighbor
+    pallas_rdma_start(
+        src_ref=x_ref,
+        dst_ref=out_ref.at[pl.ds(core_id*size, size)],
+        dst_device_id=right_neighbor,
+        src_send_sem=send_sems.at[1],
+        dst_recv_sem=recv_sems.at[1]
+    )
+
+    # Immediately place x_ref in output
+    out_ref[pl.ds(core_id*size, size)] = x_ref[pl.ds(0, size)]
+
+    # Wait for right neighbor data
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(right_neighbor*size, size)],
+        dst_recv_sem=recv_sems.at[0]
+    )
+
+    # Forward right neighbor data to left neighbor
+    pallas_rdma_start(
+        src_ref=out_ref.at[pl.ds(right_neighbor*size, size)],
+        dst_ref=out_ref.at[pl.ds(right_neighbor*size, size)],
+        dst_device_id=left_neighbor,
+        src_send_sem=send_sems.at[2],
+        dst_recv_sem=recv_sems.at[2]
+    )
+
+    # Execute all waits
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(left_neighbor*size, size)],
+        dst_recv_sem=recv_sems.at[1]
+    )
+
+    non_adjacent_neighbor = (right_neighbor + 1) % 4
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(non_adjacent_neighbor*size, size)],
+        dst_recv_sem=recv_sems.at[2]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=x_ref,
+        src_send_sem=send_sems.at[0]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=x_ref,
+        src_send_sem=send_sems.at[1]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=out_ref.at[pl.ds(right_neighbor*size, size)],
+        src_send_sem=send_sems.at[2]
+    )
+
 
 
 ## <--- /your code here --->
