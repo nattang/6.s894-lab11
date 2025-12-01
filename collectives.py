@@ -382,12 +382,18 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
             dst_ref=vmem.at[pl.ds(final_offset + shard_i*shard_size, shard_size)],
             dst_recv_sem=right_dst_sems.at[(num_devices-2)*shards_per_neighbor +shard_i]
         )
+        out_ref[pl.ds(shard_i*shard_size, shard_size)] = (
+            vmem[pl.ds(final_offset + shard_i*shard_size, shard_size)] 
+            + x_ref[pl.ds(final_offset+ shard_i*shard_size, shard_size)])
         pallas_rdma_wait_recv(
-            dst_ref=vmem.at[pl.ds(final_offset+shard_size*shards_per_neighbor + shard_i*shard_size, shard_size)],
+            dst_ref=vmem.at[pl.ds(final_offset + shard_size * shards_per_neighbor + shard_i*shard_size, shard_size)],
             dst_recv_sem=left_dst_sems.at[(num_devices-2)*shards_per_neighbor + shard_i]
         )
+        out_ref[pl.ds(shard_size * shards_per_neighbor+ shard_i * shard_size, shard_size)] = (
+            vmem[pl.ds(final_offset + shard_size * shards_per_neighbor + shard_i * shard_size, shard_size)] 
+            + x_ref[pl.ds(final_offset + shard_size * shards_per_neighbor + shard_i * shard_size, shard_size)])
     
-    out_ref[pl.ds(0, array_size)] = vmem[pl.ds(final_offset, array_size)] + x_ref[pl.ds(final_offset, array_size)]
+    # out_ref[pl.ds(0, array_size)] = vmem[pl.ds(final_offset, array_size)] + x_ref[pl.ds(final_offset, array_size)]
     
 
 
