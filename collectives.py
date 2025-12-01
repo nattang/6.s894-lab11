@@ -279,8 +279,8 @@ def all_gather_pallas_scratch_specs(x):
     # Works the same way as the earlier scratch specs function
     # (see `exchange_with_neighbor_pallas_scratch_specs` above)
     return {
-        "send_sems" : pltpu.SemaphoreType.DMA(shape=(4,)),
-        "recv_sems" : pltpu.SemaphoreType.DMA(shape=(4,)),
+        "send_sems" : pltpu.SemaphoreType.DMA(shape=(6,)),
+        "recv_sems" : pltpu.SemaphoreType.DMA(shape=(6,)),
     }
 
 
@@ -307,57 +307,76 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
 
     # Get size at trace time
     size = x_ref.shape[0]
+    half_size = size // 2
 
     # Compute neighbor ids
     left_neighbor  = (core_id - 1) % 4
     right_neighbor = (core_id + 1) % 4
 
-    # Send data to left neighbor
+    # Send data top half to left neighbor
     pallas_rdma_start(
-        src_ref=x_ref,
-        dst_ref=out_ref.at[pl.ds(core_id*size, size)],
+        src_ref=x_ref.at[pl.ds(0, half_size)],
+        dst_ref=out_ref.at[pl.ds(core_id*size, half_size)],
         dst_device_id=left_neighbor,
         src_send_sem=send_sems.at[0],
         dst_recv_sem=recv_sems.at[0]
     )
 
-    # Send data to right neighbor
+    # Send data bottom half to left neighbor
     pallas_rdma_start(
-        src_ref=x_ref,
-        dst_ref=out_ref.at[pl.ds(core_id*size, size)],
+        src_ref=x_ref.at[pl.ds(half_size, half_size)],
+        dst_ref=out_ref.at[pl.ds(core_id*size + half_size, half_size)],
+        dst_device_id=left_neighbor,
+        src_send_sem=send_sems.at[4],
+        dst_recv_sem=recv_sems.at[4]
+    )
+
+    # Send data bottom half to right neighbor
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(half_size, half_size)],
+        dst_ref=out_ref.at[pl.ds(core_id*size + half_size, half_size)],
         dst_device_id=right_neighbor,
         src_send_sem=send_sems.at[1],
         dst_recv_sem=recv_sems.at[1]
     )
 
+    # Send data top half to right neighbor
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(0, half_size)],
+        dst_ref=out_ref.at[pl.ds(core_id*size, half_size)],
+        dst_device_id=right_neighbor,
+        src_send_sem=send_sems.at[5],
+        dst_recv_sem=recv_sems.at[5]
+    )
+
     # Immediately place x_ref in output
     out_ref[pl.ds(core_id*size, size)] = x_ref[pl.ds(0, size)]
 
-    # Wait for right neighbor data
+    # Wait for right neighbor top half data
     pallas_rdma_wait_recv(
-        dst_ref=out_ref.at[pl.ds(right_neighbor*size, size)],
+        dst_ref=out_ref.at[pl.ds(right_neighbor*size, half_size)],
         dst_recv_sem=recv_sems.at[0]
     )
 
     # Forward upper half of right neighbor data to left neighbor
     pallas_rdma_start(
-        src_ref=out_ref.at[pl.ds(right_neighbor*size, size//2)],
-        dst_ref=out_ref.at[pl.ds(right_neighbor*size, size//2)],
+        src_ref=out_ref.at[pl.ds(right_neighbor*size, half_size)],
+        dst_ref=out_ref.at[pl.ds(right_neighbor*size, half_size)],
         dst_device_id=left_neighbor,
         src_send_sem=send_sems.at[2],
         dst_recv_sem=recv_sems.at[2]
     )
 
-    # Wait for left neighbor data
+    # Wait for left neighbor bottom half data
     pallas_rdma_wait_recv(
-        dst_ref=out_ref.at[pl.ds(left_neighbor*size, size)],
+        dst_ref=out_ref.at[pl.ds(left_neighbor*size + half_size, half_size)],
         dst_recv_sem=recv_sems.at[1]
     )
 
     # Forward lower half of left neighbor data to right neighbor
     pallas_rdma_start(
-        src_ref=out_ref.at[pl.ds(left_neighbor*size + size//2, size//2)],
-        dst_ref=out_ref.at[pl.ds(left_neighbor*size + size//2, size//2)],
+        src_ref=out_ref.at[pl.ds(left_neighbor*size + half_size, half_size)],
+        dst_ref=out_ref.at[pl.ds(left_neighbor*size + half_size, half_size)],
         dst_device_id=right_neighbor,
         src_send_sem=send_sems.at[3],
         dst_recv_sem=recv_sems.at[3]
@@ -368,32 +387,52 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
     non_adjacent_neighbor = (right_neighbor + 1) % 4
 
     pallas_rdma_wait_send(
-        src_ref=x_ref,
+        src_ref=x_ref.at[pl.ds(0, half_size)],
         src_send_sem=send_sems.at[0]
     )
 
     pallas_rdma_wait_send(
-        src_ref=x_ref,
+        src_ref=x_ref.at[pl.ds(half_size, half_size)],
         src_send_sem=send_sems.at[1]
     )
 
     pallas_rdma_wait_send(
-        src_ref=out_ref.at[pl.ds(right_neighbor*size, size//2)],
+        src_ref=out_ref.at[pl.ds(right_neighbor*size, half_size)],
         src_send_sem=send_sems.at[2]
     )
 
     pallas_rdma_wait_send(
-        src_ref=out_ref.at[pl.ds(left_neighbor*size + size//2, size//2)],
+        src_ref=out_ref.at[pl.ds(left_neighbor*size + half_size, half_size)],
         src_send_sem=send_sems.at[3]
     )
 
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(half_size, half_size)],
+        src_send_sem=send_sems.at[4]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(0, half_size)],
+        src_send_sem=send_sems.at[5]
+    )
+
     pallas_rdma_wait_recv(
-        dst_ref=out_ref.at[pl.ds(non_adjacent_neighbor*size, size//2)],
+        dst_ref=out_ref.at[pl.ds(right_neighbor*size + half_size, half_size)],
+        dst_recv_sem=recv_sems.at[4]
+    )
+
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(left_neighbor*size, half_size)],
+        dst_recv_sem=recv_sems.at[5]
+    )
+
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(non_adjacent_neighbor*size, half_size)],
         dst_recv_sem=recv_sems.at[2]
     )
 
     pallas_rdma_wait_recv(
-        dst_ref=out_ref.at[pl.ds(non_adjacent_neighbor*size + size//2, size//2)],
+        dst_ref=out_ref.at[pl.ds(non_adjacent_neighbor*size + half_size, half_size)],
         dst_recv_sem=recv_sems.at[3]
     )
 
