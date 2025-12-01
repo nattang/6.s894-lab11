@@ -279,8 +279,8 @@ def all_gather_pallas_scratch_specs(x):
     # Works the same way as the earlier scratch specs function
     # (see `exchange_with_neighbor_pallas_scratch_specs` above)
     return {
-        "send_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
-        "recv_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
+        "send_sems" : pltpu.SemaphoreType.DMA(shape=(4,)),
+        "recv_sems" : pltpu.SemaphoreType.DMA(shape=(4,)),
     }
 
 
@@ -339,26 +339,33 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
         dst_recv_sem=recv_sems.at[0]
     )
 
-    # Forward right neighbor data to left neighbor
+    # Forward upper half of right neighbor data to left neighbor
     pallas_rdma_start(
-        src_ref=out_ref.at[pl.ds(right_neighbor*size, size)],
-        dst_ref=out_ref.at[pl.ds(right_neighbor*size, size)],
+        src_ref=out_ref.at[pl.ds(right_neighbor*size, size//2)],
+        dst_ref=out_ref.at[pl.ds(right_neighbor*size, size//2)],
         dst_device_id=left_neighbor,
         src_send_sem=send_sems.at[2],
         dst_recv_sem=recv_sems.at[2]
     )
 
-    # Execute all waits
+    # Wait for left neighbor data
     pallas_rdma_wait_recv(
         dst_ref=out_ref.at[pl.ds(left_neighbor*size, size)],
         dst_recv_sem=recv_sems.at[1]
     )
 
-    non_adjacent_neighbor = (right_neighbor + 1) % 4
-    pallas_rdma_wait_recv(
-        dst_ref=out_ref.at[pl.ds(non_adjacent_neighbor*size, size)],
-        dst_recv_sem=recv_sems.at[2]
+    # Forward lower half of left neighbor data to right neighbor
+    pallas_rdma_start(
+        src_ref=out_ref.at[pl.ds(left_neighbor*size + size//2, size//2)],
+        dst_ref=out_ref.at[pl.ds(left_neighbor*size + size//2, size//2)],
+        dst_device_id=right_neighbor,
+        src_send_sem=send_sems.at[3],
+        dst_recv_sem=recv_sems.at[3]
     )
+
+    # Execute all waits
+
+    non_adjacent_neighbor = (right_neighbor + 1) % 4
 
     pallas_rdma_wait_send(
         src_ref=x_ref,
@@ -371,10 +378,24 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
     )
 
     pallas_rdma_wait_send(
-        src_ref=out_ref.at[pl.ds(right_neighbor*size, size)],
+        src_ref=out_ref.at[pl.ds(right_neighbor*size, size//2)],
         src_send_sem=send_sems.at[2]
     )
 
+    pallas_rdma_wait_send(
+        src_ref=out_ref.at[pl.ds(left_neighbor*size + size//2, size//2)],
+        src_send_sem=send_sems.at[3]
+    )
+
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(non_adjacent_neighbor*size, size//2)],
+        dst_recv_sem=recv_sems.at[2]
+    )
+
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(non_adjacent_neighbor*size + size//2, size//2)],
+        dst_recv_sem=recv_sems.at[3]
+    )
 
 
 ## <--- /your code here --->
