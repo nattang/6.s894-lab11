@@ -243,10 +243,10 @@ def reduce_scatter_pallas_scratch_specs(x):
     * `x`: Traced input array. You can use `x.shape` to query its shape at trace time.
     """
 
-    # Works the same way as the earlier scratch specs function
-    # (see `exchange_with_neighbor_pallas_scratch_specs` above)
     return {
-        # TODO: your code here
+        "vmem" : pltpu.VMEM(shape=x.shape, dtype=jnp.float32),
+        "send_sems" : pltpu.SemaphoreType.DMA(shape=(8,)),
+        "recv_sems" : pltpu.SemaphoreType.DMA(shape=(8,)),
     }
 
 
@@ -265,8 +265,130 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
       `reduce_scatter_pallas_scratch_specs`.
     """
 
-    # TODO: your code here
-    pass
+    # Get ID's
+    core_id = pallas_get_my_device_id()
+    left_id = (core_id - 1) % 4
+    right_id = (core_id + 1) % 4
+    cross_id = (core_id + 2) % 4
+
+    # Get shape
+    shape = out_ref.shape[0]
+    shard_size = shape // 2
+
+    # Get Semaphores
+    send_sems = scratch_refs["send_sems"]
+    recv_sems = scratch_refs["recv_sems"]
+
+    # Get VMEM
+    vmem = scratch_refs["vmem"]
+
+    # Top shards sent left, Bottom shards sent right
+    # Create the send schedule for clean program
+    # Format: (mem sent left, mem sent right)
+    schedule = [
+        core_id  * shape, core_id  *  shape  + shard_size,
+        right_id * shape, left_id  * shape + shard_size,
+        cross_id * shape, cross_id * shape + shard_size,
+        left_id  * shape, right_id * shape + shard_size
+    ]
+
+    # NOTE: Initial sends slightly different since no accumalate
+
+    # Top shard sent left
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(schedule[0], shard_size)],
+        dst_ref=vmem.at[pl.ds(schedule[0], shard_size)],
+        dst_device_id=left_id,
+        src_send_sem=send_sems[0],
+        dst_recv_sem=recv_sems[0]
+    )
+
+    # Bottom shard sent right
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(schedule[1], shard_size)],
+        dst_ref=vmem.at[pl.ds(schedule[1], shard_size)],
+        dst_device_id=right_id,
+        src_send_sem=send_sems[1],
+        dst_recv_sem=recv_sems[1]
+    )
+
+    # Wait for schedule[2] (shard traveling left)
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(schedule[2], shard_size)],
+        dst_recv_sem=recv_sems.at[0]
+    )
+
+    # Accumalate schedule[2]
+    x_ref.at[pl.ds(schedule[2], shard_size)] = \
+    x_ref.at[pl.ds(schedule[2], shard_size)] + vmem[pl.ds(schedule[2], shard_size)]
+
+    # Wait for schedule[3] (shard traveling right)
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(schedule[3], shard_size)],
+        dst_recv_sem=recv_sems.at[1]
+    )
+
+    for i in range(2, 6):
+
+        # Pipelined send
+        pallas_rdma_start(
+            src_ref=x_ref.at[pl.ds(schedule[i], shard_size)],
+            dst_ref=vmem.at[pl.ds(schedule[i], shard_size)],
+            dst_device_id=left_id,
+            src_send_sem=send_sems[i],
+            dst_recv_sem=recv_sems[i]
+        )
+
+        # Pipelined accumulate
+        x_ref.at[pl.ds(schedule[i+1], shard_size)] = \
+        x_ref.at[pl.ds(schedule[i+1], shard_size)] + vmem[pl.ds(schedule[i+1], shard_size)]
+
+        # Pipelined receive
+        pallas_rdma_wait_recv(
+            dst_ref=vmem.at[pl.ds(schedule[i+2], shard_size)],
+            dst_recv_sem=recv_sems.at[i]
+        )
+
+    # Final send left
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(schedule[6], shard_size)],
+        dst_ref=out_ref.at[pl.ds(0, shard_size)],
+        dst_device_id=left_id,
+        src_send_sem=send_sems[6],
+        dst_recv_sem=recv_sems[6]
+    )
+
+    # Final accumulate (right shard)
+    x_ref.at[pl.ds(schedule[7], shard_size)] = \
+        x_ref.at[pl.ds(schedule[7], shard_size)] + vmem[pl.ds(schedule[7], shard_size)]
+
+    # final send right
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(schedule[7], shard_size)],
+        dst_ref=out_ref.at[pl.ds(shard_size, shard_size)],
+        dst_device_id=right_id,
+        src_send_sem=send_sems[7],
+        dst_recv_sem=recv_sems[7]
+    )
+
+    # Final Receives (no accumulate)
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(0, shard_size)],
+        dst_recv_sem=recv_sems.at[6]
+    )
+
+    pallas_rdma_wait_recv(
+        dst_ref=out_ref.at[pl.ds(shard_size, shard_size)],
+        dst_recv_sem=recv_sems.at[7]
+    )
+
+    # All wait_sends
+    for i, addr in enumerate(schedule):
+
+        pallas_rdma_wait_send(
+            src_ref=x_ref.at[pl.ds(addr, shard_size)],
+            src_send_sem=send_sems.at[i]
+        )
 
 
 def all_gather_pallas_scratch_specs(x):
