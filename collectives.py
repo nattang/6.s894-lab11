@@ -299,8 +299,8 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
         src_ref=x_ref.at[pl.ds(schedule[0], shard_size)],
         dst_ref=vmem.at[pl.ds(schedule[0], shard_size)],
         dst_device_id=left_id,
-        src_send_sem=send_sems[0],
-        dst_recv_sem=recv_sems[0]
+        src_send_sem=send_sems.at[0],
+        dst_recv_sem=recv_sems.at[0]
     )
 
     # Bottom shard sent right
@@ -308,8 +308,8 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
         src_ref=x_ref.at[pl.ds(schedule[1], shard_size)],
         dst_ref=vmem.at[pl.ds(schedule[1], shard_size)],
         dst_device_id=right_id,
-        src_send_sem=send_sems[1],
-        dst_recv_sem=recv_sems[1]
+        src_send_sem=send_sems.at[1],
+        dst_recv_sem=recv_sems.at[1]
     )
 
     # Wait for schedule[2] (shard traveling left)
@@ -319,8 +319,8 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     )
 
     # Accumalate schedule[2]
-    x_ref.at[pl.ds(schedule[2], shard_size)] = \
-    x_ref.at[pl.ds(schedule[2], shard_size)] + vmem[pl.ds(schedule[2], shard_size)]
+    x_ref[pl.ds(schedule[2], shard_size)] = \
+    x_ref[pl.ds(schedule[2], shard_size)] + vmem[pl.ds(schedule[2], shard_size)]
 
     # Wait for schedule[3] (shard traveling right)
     pallas_rdma_wait_recv(
@@ -340,13 +340,13 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
             src_ref=x_ref.at[pl.ds(schedule[i], shard_size)],
             dst_ref=vmem.at[pl.ds(schedule[i], shard_size)],
             dst_device_id=id,
-            src_send_sem=send_sems[i],
-            dst_recv_sem=recv_sems[i]
+            src_send_sem=send_sems.at[i],
+            dst_recv_sem=recv_sems.at[i]
         )
 
         # Pipelined accumulate
-        x_ref.at[pl.ds(schedule[i+1], shard_size)] = \
-        x_ref.at[pl.ds(schedule[i+1], shard_size)] + vmem[pl.ds(schedule[i+1], shard_size)]
+        x_ref[pl.ds(schedule[i+1], shard_size)] = \
+        x_ref[pl.ds(schedule[i+1], shard_size)] + vmem[pl.ds(schedule[i+1], shard_size)]
 
         # Pipelined receive
         pallas_rdma_wait_recv(
@@ -359,21 +359,21 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
         src_ref=x_ref.at[pl.ds(schedule[6], shard_size)],
         dst_ref=out_ref.at[pl.ds(0, shard_size)],
         dst_device_id=left_id,
-        src_send_sem=send_sems[6],
-        dst_recv_sem=recv_sems[6]
+        src_send_sem=send_sems.at[6],
+        dst_recv_sem=recv_sems.at[6]
     )
 
     # Final accumulate (right shard)
-    x_ref.at[pl.ds(schedule[7], shard_size)] = \
-        x_ref.at[pl.ds(schedule[7], shard_size)] + vmem[pl.ds(schedule[7], shard_size)]
+    x_ref[pl.ds(schedule[7], shard_size)] = \
+        x_ref[pl.ds(schedule[7], shard_size)] + vmem[pl.ds(schedule[7], shard_size)]
 
     # final send right
     pallas_rdma_start(
         src_ref=x_ref.at[pl.ds(schedule[7], shard_size)],
         dst_ref=out_ref.at[pl.ds(shard_size, shard_size)],
         dst_device_id=right_id,
-        src_send_sem=send_sems[7],
-        dst_recv_sem=recv_sems[7]
+        src_send_sem=send_sems.at[7],
+        dst_recv_sem=recv_sems.at[7]
     )
 
     # Final Receives (no accumulate)
