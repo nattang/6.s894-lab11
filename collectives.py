@@ -330,11 +330,16 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
 
     for i in range(2, 6):
 
+        if i % 2 == 0:
+            id = left_id
+
+        else:
+            id = right_id
         # Pipelined send
         pallas_rdma_start(
             src_ref=x_ref.at[pl.ds(schedule[i], shard_size)],
             dst_ref=vmem.at[pl.ds(schedule[i], shard_size)],
-            dst_device_id=left_id,
+            dst_device_id=id,
             src_send_sem=send_sems[i],
             dst_recv_sem=recv_sems[i]
         )
