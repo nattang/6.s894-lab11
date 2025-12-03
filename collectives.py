@@ -254,6 +254,8 @@ def reduce_scatter_pallas_scratch_specs(x):
         "left_dst_dma_sems": pltpu.SemaphoreType.DMA(shape=(num_rdmas,)),
     }
 
+def reduce_scatter_pallas_kernel_small(x_ref, out_ref):
+    pass
 
 def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     """
