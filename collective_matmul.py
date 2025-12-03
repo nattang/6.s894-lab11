@@ -166,7 +166,7 @@ def pallas_rdma_wait_recv(*, dst_ref, dst_recv_sem):
 
 def matmul_pallas_scratch_specs(x, w):
     return {
-        # TODO: your code here
+        # "scratch": pltpu.VMEM(shape=(x.shape[0], x.shape[1]), dtype=jnp.float32),
     }
 
 
@@ -180,14 +180,27 @@ def matmul_pallas_kernel(x_ref, w_ref, out_ref, scratch_refs):
 
     All arrays are in VMEM and have dtype bfloat16.
     """
+    n_batch = x_ref.shape[0]
+    k1 = x_ref.shape[1]
+    k2 = w_ref.shape[1]
 
-    # TODO: your code here
-    pass
+    out_ref[pl.ds(0, n_batch), pl.ds(0, k2)] = jnp.astype(
+        pl.dot(
+            x_ref[pl.ds(0, n_batch), pl.ds(0, k1)],
+            w_ref[pl.ds(0, k1), pl.ds(0, k2)],
+            trans_a=False,
+            trans_b=False
+        ),
+        x_ref.dtype
+    )
 
 
 def all_gather_matmul_pallas_scratch_specs(x):
+    num_rdmas = 6 # TODO: figure out actual num
     return {
-        # TODO: your code here
+        "vmem": pltpu.VMEM(shape=(x.shape[0], x.shape[1] * 4), dtype=x.dtype),
+        "src_dma_sems": pltpu.SemaphoreType.DMA(shape=(num_rdmas,)),
+        "dst_dma_sems": pltpu.SemaphoreType.DMA(shape=(num_rdmas,)),
     }
 
 
@@ -202,9 +215,136 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
 
     All arrays are in VMEM and have dtype bfloat16.
     """
+    id = pallas_get_my_device_id()
+    n_batch = x_ref.shape[0]
+    k1 = w1_ref.shape[0]
+    k2 = w1_ref.shape[1]
+    array_size = x_ref.shape[1]
+    shard_size = array_size // 2
 
-    # TODO: your code here
-    pass
+    src_sems = scratch_refs["src_dma_sems"]
+    dst_sems = scratch_refs["dst_dma_sems"]
+    vmem = scratch_refs["vmem"]
+
+    # send to right neighbor
+    right_neighbor = (id + 1) % 4
+    left_neighbor = (id - 1) % 4
+
+    #TODO: make dma indices more clear?
+    # split array in two, send as two rdmas to right neighbor
+    # note: sending bottom half first since we need it to send to the left neighbor
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(0, n_batch), pl.ds(shard_size, shard_size)],
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(id * array_size + shard_size, shard_size)], 
+        dst_device_id=right_neighbor,
+        src_send_sem=src_sems.at[0],
+        dst_recv_sem=dst_sems.at[0]
+    )
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(0, n_batch), pl.ds(0, shard_size)],
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(id * array_size, shard_size)],
+        dst_device_id=right_neighbor,
+        src_send_sem=src_sems.at[1],
+        dst_recv_sem=dst_sems.at[1]
+    )
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(0, n_batch), pl.ds(0, shard_size)],
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(id * array_size, shard_size)],
+        dst_device_id=left_neighbor,
+        src_send_sem=src_sems.at[2],
+        dst_recv_sem=dst_sems.at[2]
+    )
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(0, n_batch), pl.ds(shard_size, shard_size)],
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(id * array_size + shard_size, shard_size)],
+        dst_device_id=left_neighbor,
+        src_send_sem=src_sems.at[3],
+        dst_recv_sem=dst_sems.at[3]
+    )
+
+    vmem[pl.ds(0, n_batch), pl.ds(id*array_size, array_size)] = x_ref[pl.ds(0, n_batch), pl.ds(0, array_size)]
+
+    # wait for the halves that need to be written to neighbors to be recieved
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(right_neighbor * array_size + shard_size, shard_size)], 
+        dst_recv_sem=dst_sems.at[0] # bottom half of rdma from right neighbor
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(left_neighbor * array_size, shard_size)], 
+        dst_recv_sem=dst_sems.at[2] # top half of rdma from left neighbor
+    )    
+
+    # # write missing tiles
+    pallas_rdma_start(
+        src_ref=vmem.at[pl.ds(0, n_batch), pl.ds(left_neighbor * array_size, shard_size)],
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(left_neighbor * array_size, shard_size)],
+        dst_device_id=right_neighbor,
+        src_send_sem=src_sems.at[4],
+        dst_recv_sem=dst_sems.at[4]
+    )
+    pallas_rdma_start(
+        src_ref=vmem.at[pl.ds(0, n_batch), pl.ds(right_neighbor * array_size + shard_size, shard_size)],
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(right_neighbor * array_size + shard_size, shard_size)],
+        dst_device_id=left_neighbor,
+        src_send_sem=src_sems.at[5],
+        dst_recv_sem=dst_sems.at[5]
+    )
+
+    # wait for all rdma reads
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(0, n_batch), pl.ds(shard_size, shard_size)], 
+        src_send_sem=src_sems.at[0]
+    )
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(0, n_batch), pl.ds(0, shard_size)],
+        src_send_sem=src_sems.at[1]
+    )
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(0, n_batch), pl.ds(0, shard_size)], 
+        src_send_sem=src_sems.at[2]
+    )
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(0, n_batch), pl.ds(shard_size, shard_size)], 
+        src_send_sem=src_sems.at[3]
+    )
+    pallas_rdma_wait_send(
+        src_ref=vmem.at[pl.ds(0, n_batch), pl.ds(left_neighbor * array_size, shard_size)], 
+        src_send_sem=src_sems.at[4]
+    )
+    pallas_rdma_wait_send(
+        src_ref=vmem.at[pl.ds(0, n_batch), pl.ds(right_neighbor * array_size + shard_size, shard_size)], 
+        src_send_sem=src_sems.at[5]
+    )
+
+    # wait for second phase of rdmas to finish writing
+    missing = (id + 2) % 4
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(right_neighbor * array_size, shard_size)], 
+        dst_recv_sem=dst_sems.at[1] # bottom half of rdma from right neighbor
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(left_neighbor * array_size + shard_size, shard_size)], 
+        dst_recv_sem=dst_sems.at[3] # top half of rdma from left neighbor
+    )   
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(missing * array_size, shard_size)], 
+        dst_recv_sem=dst_sems.at[4]
+    )
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(0, n_batch), pl.ds(missing * array_size+ shard_size, shard_size)], 
+        dst_recv_sem=dst_sems.at[5]
+    )
+
+    out_ref[pl.ds(0, n_batch), pl.ds(0, k2)] = jnp.astype(
+        pl.dot(
+            vmem[pl.ds(0, n_batch), pl.ds(0, k1)],
+            w1_ref[pl.ds(0, k1), pl.ds(0, k2)],
+            trans_a=False,
+            trans_b=False
+        ),
+        x_ref.dtype
+    )
+
 
 
 def matmul_reduce_scatter_pallas_scratch_specs(x):
@@ -252,8 +392,8 @@ def neural_network_pallas_kernel(init_x_ref, w1_refs, w2_refs, out_ref, scratch_
     * out_ref: Pallas array reference with shape [N_BATCH, K1]. Should be written to.
     """
 
-    # TODO: your code here
     pass
+
 
 
 ## <--- /your code here --->
