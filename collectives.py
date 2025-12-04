@@ -337,20 +337,20 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     )
 
     # Accumulate and Send
-    x_ref[pl.ds(left_id * size, half_size)] = x_ref[pl.ds(left_id * size, half_size)] + vmem1[pl.ds(left_id * size, half_size)]
+    vmem1[pl.ds(left_id * size, half_size)] = x_ref[pl.ds(left_id * size, half_size)] + vmem1[pl.ds(left_id * size, half_size)]
 
     pallas_rdma_start(
-        src_ref=x_ref.at[pl.ds(left_id * size, half_size)],
+        src_ref=vmem1.at[pl.ds(left_id * size, half_size)],
         dst_ref=vmem2.at[pl.ds(left_id * size, half_size)],
         dst_device_id=left_id,
         src_send_sem=left_send_sems.at[2],
         dst_recv_sem=right_recv_sems.at[2]
     )
     
-    x_ref[pl.ds(right_id * size + half_size, half_size)] = x_ref[pl.ds(right_id * size + half_size, half_size)] + vmem1[pl.ds(right_id * size + half_size, half_size)]
+    vmem1[pl.ds(right_id * size + half_size, half_size)] = x_ref[pl.ds(right_id * size + half_size, half_size)] + vmem1[pl.ds(right_id * size + half_size, half_size)]
 
     pallas_rdma_start(
-        src_ref=x_ref.at[pl.ds(right_id * size + half_size, half_size)],
+        src_ref=vmem1.at[pl.ds(right_id * size + half_size, half_size)],
         dst_ref=vmem2.at[pl.ds(right_id * size + half_size, half_size)],
         dst_device_id=right_id,
         src_send_sem=right_send_sems.at[2],
@@ -407,12 +407,12 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     )
 
     pallas_rdma_wait_send(
-        src_ref=x_ref.at[pl.ds(left_id * size, half_size)],
+        src_ref=vmem1.at[pl.ds(left_id * size, half_size)],
         src_send_sem=left_send_sems.at[2]
     )
 
     pallas_rdma_wait_send(
-        src_ref=x_ref.at[pl.ds(right_id * size + half_size, half_size)],
+        src_ref=vmem1.at[pl.ds(right_id * size + half_size, half_size)],
         src_send_sem=right_send_sems.at[2]
     )
 
