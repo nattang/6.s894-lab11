@@ -453,7 +453,7 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
     send_sems = scratch_refs["send_sems"]
     recv_sems = scratch_refs["recv_sems"]
 
-    # Get size at trace time
+    # Get size at run time
     size = x_ref.shape[0]
     half_size = size // 2
 

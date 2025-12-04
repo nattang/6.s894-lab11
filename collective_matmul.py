@@ -179,13 +179,24 @@ def matmul_pallas_kernel(x_ref, w_ref, out_ref, scratch_refs):
 
     All arrays are in VMEM and have dtype bfloat16.
     """
+    
+    N_BATCH = x_ref.shape[0]
+    M = x_ref.shape[1]
+    N = w_ref.shape[1]
 
-    out_ref.at[] = jnp.astype(pl.dot(x_ref, w_ref), jnp.bfloat16)
+    out_ref[pl.ds(0, N_BATCH), pl.ds(0, N)] = jnp.astype(
+        pl.dot(x_ref[pl.ds(0, N_BATCH), pl.ds(0, M)], 
+               w_ref[pl.ds(0, M), pl.ds(0, N)]),
+        jnp.bfloat16
+    )
 
 
 def all_gather_matmul_pallas_scratch_specs(x):
+
     return {
-        # TODO: your code here
+        "vmem"      : pltpu.VMEM(shape=(x.shape[0], x.shape[1] * 4), dtype=jnp.bfloat16),
+        "send_sems" : pltpu.SemaphoreType.DMA(shape=(6,)),
+        "recv_sems" : pltpu.SemaphoreType.DMA(shape=(6,)),
     }
 
 
@@ -201,8 +212,155 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
     All arrays are in VMEM and have dtype bfloat16.
     """
 
-    # TODO: your code here
-    pass
+    # Get core id
+    core_id = pallas_get_my_device_id()
+
+    # Get Semaphores
+    send_sems = scratch_refs["send_sems"]
+    recv_sems = scratch_refs["recv_sems"]
+
+    # Get Vmem
+    vmem = scratch_refs["vmem"]
+
+    # Get size at run time
+    size = x_ref.shape[0]
+    dim2 = x_ref.shape[1]
+    half_size = size // 2
+
+    # Compute neighbor ids
+    left_neighbor  = (core_id - 1) % 4
+    right_neighbor = (core_id + 1) % 4
+
+    # Send data top half to left neighbor
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(0, half_size), pl.ds(0, dim2)],
+        dst_ref=vmem.at[pl.ds(0, half_size), pl.ds(core_id*dim2, dim2)],
+        dst_device_id=left_neighbor,
+        src_send_sem=send_sems.at[0],
+        dst_recv_sem=recv_sems.at[0]
+    )
+
+    # Send data bottom half to left neighbor
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(half_size, half_size), pl.ds(0, dim2)],
+        dst_ref=vmem.at[pl.ds(half_size, half_size), pl.ds(core_id*dim2, dim2)],
+        dst_device_id=left_neighbor,
+        src_send_sem=send_sems.at[4],
+        dst_recv_sem=recv_sems.at[4]
+    )
+
+    # Send data bottom half to right neighbor
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(half_size, half_size), pl.ds(0, dim2)],
+        dst_ref=vmem.at[pl.ds(half_size, half_size), pl.ds(core_id*dim2, dim2)],
+        dst_device_id=right_neighbor,
+        src_send_sem=send_sems.at[1],
+        dst_recv_sem=recv_sems.at[1]
+    )
+
+    # Send data top half to right neighbor
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(0, half_size), pl.ds(0, dim2)],
+        dst_ref=vmem.at[pl.ds(0, half_size), pl.ds(core_id*dim2, dim2)],
+        dst_device_id=right_neighbor,
+        src_send_sem=send_sems.at[5],
+        dst_recv_sem=recv_sems.at[5]
+    )
+
+    # Immediately place x_ref matmul in output
+    vmem[pl.ds(0, size), pl.ds(core_id*dim2, dim2)] = x_ref[pl.ds(0, size), pl.ds(0, dim2)]
+
+    # Wait for right neighbor top half data
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(0, half_size), pl.ds(right_neighbor*dim2, dim2)],
+        dst_recv_sem=recv_sems.at[0]
+    )
+
+    # Forward upper half of right neighbor data to left neighbor
+    pallas_rdma_start(
+        src_ref=vmem.at[pl.ds(0, half_size), pl.ds(right_neighbor*dim2, dim2)],
+        dst_ref=vmem.at[pl.ds(0, half_size), pl.ds(right_neighbor*dim2, dim2)],
+        dst_device_id=left_neighbor,
+        src_send_sem=send_sems.at[2],
+        dst_recv_sem=recv_sems.at[2]
+    )
+
+    # Wait for left neighbor bottom half data
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(half_size, half_size), pl.ds(left_neighbor*dim2, dim2)],
+        dst_recv_sem=recv_sems.at[1]
+    )
+
+    # Forward lower half of left neighbor data to right neighbor
+    pallas_rdma_start(
+        src_ref=vmem.at[pl.ds(half_size, half_size), pl.ds(left_neighbor*dim2, dim2)],
+        dst_ref=vmem.at[pl.ds(half_size, half_size), pl.ds(left_neighbor*dim2, dim2)],
+        dst_device_id=right_neighbor,
+        src_send_sem=send_sems.at[3],
+        dst_recv_sem=recv_sems.at[3]
+    )
+
+    # Execute all waits
+
+    non_adjacent_neighbor = (right_neighbor + 1) % 4
+
+
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(half_size, half_size), pl.ds(right_neighbor*dim2, dim2)],
+        dst_recv_sem=recv_sems.at[4]
+    )
+
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(0, half_size), pl.ds(left_neighbor*dim2, dim2)],
+        dst_recv_sem=recv_sems.at[5]
+    )
+
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(0, half_size), pl.ds(non_adjacent_neighbor*dim2, dim2)],
+        dst_recv_sem=recv_sems.at[2]
+    )
+
+    pallas_rdma_wait_recv(
+        dst_ref=vmem.at[pl.ds(half_size, half_size), pl.ds(non_adjacent_neighbor*dim2, dim2)],
+        dst_recv_sem=recv_sems.at[3]
+    )
+
+    out_ref[pl.ds(0, out_ref.shape[0]), pl.ds(0, out_ref.shape[1])] = jnp.astype(
+        pl.dot(vmem[pl.ds(0, vmem.shape[0]), pl.ds(0, vmem.shape[1])], 
+               w1_ref[pl.ds(0, w1_ref.shape[0]), pl.ds(0, w1_ref.shape[1])]),
+        jnp.bfloat16
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(0, half_size), pl.ds(0, dim2)],
+        src_send_sem=send_sems.at[0]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(half_size, half_size), pl.ds(0, dim2)],
+        src_send_sem=send_sems.at[1]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=vmem.at[pl.ds(0, half_size), pl.ds(right_neighbor*dim2, dim2)],
+        src_send_sem=send_sems.at[2]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=vmem.at[pl.ds(half_size, half_size), pl.ds(left_neighbor*dim2, dim2)],
+        src_send_sem=send_sems.at[3]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(half_size, half_size), pl.ds(0, dim2)],
+        src_send_sem=send_sems.at[4]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(0, half_size), pl.ds(0, dim2)],
+        src_send_sem=send_sems.at[5]
+    )
+    
 
 
 def matmul_reduce_scatter_pallas_scratch_specs(x):
