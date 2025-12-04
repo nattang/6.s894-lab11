@@ -234,7 +234,7 @@ def exchange_with_neighbor_pallas_kernel(x_ref, out_ref, scratch_refs):
         dst_recv_sem=recv_sems
     )
 
-
+NUM_SHARDS = 1
 def reduce_scatter_pallas_scratch_specs(x):
     """
     Arguments:
@@ -242,18 +242,15 @@ def reduce_scatter_pallas_scratch_specs(x):
     * `x`: Traced input array. You can use `x.shape` to query its shape at trace time.
     """
 
-    if x.shape[0] // 4 > 4:
-        NUM_SHARDS = 16
-    else:
-        NUM_SHARDS = 1
-
     return {
-        "vmem" : pltpu.VMEM(shape=x.shape, dtype=jnp.float32),
-        "left_send_sems" : [pltpu.SemaphoreType.DMA(shape=(4,)) for _ in range(NUM_SHARDS)],
-        "right_send_sems" : [pltpu.SemaphoreType.DMA(shape=(4,)) for _ in range(NUM_SHARDS)],
-        "left_recv_sems" : [pltpu.SemaphoreType.DMA(shape=(4,)) for _ in range(NUM_SHARDS)],
-        "right_recv_sems" : [pltpu.SemaphoreType.DMA(shape=(4,)) for _ in range(NUM_SHARDS)],
+        "vmem1" : pltpu.VMEM(shape=x.shape, dtype=jnp.float32),
+        "vmem2" : pltpu.VMEM(shape=x.shape, dtype=jnp.float32),
+        "left_send_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
+        "right_send_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
+        "left_recv_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
+        "right_recv_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
     }
+
 
 
 def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
@@ -278,13 +275,8 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     cross_id = (core_id + 2) % 4
 
     # Get shape
-    shape = out_ref.shape[0]
-    if shape > 4:
-        NUM_SHARDS = 16
-    else:
-        NUM_SHARDS = 1
-    half_size = shape // 2
-    shard_size = half_size // NUM_SHARDS
+    size = out_ref.shape[0]
+    half_size = size // 2
 
     # Get Semaphores
     left_send_sems = scratch_refs["left_send_sems"]
@@ -293,134 +285,136 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     right_recv_sems = scratch_refs["right_recv_sems"]
 
     # Get VMEM
-    vmem = scratch_refs["vmem"]
+    vmem1 = scratch_refs["vmem1"]
+    vmem2 = scratch_refs["vmem2"]
 
-    # Top shards sent left, Bottom shards sent right
-    # Create the send schedule for clean program
-    # Format: (mem sent left, mem sent right)
-    schedule = [
-        (core_id  * shape, core_id  * shape  + half_size),
-        (right_id * shape, left_id  * shape + half_size),
-        (cross_id * shape, cross_id * shape + half_size),
-        (left_id  * shape, right_id * shape + half_size)
-    ]
+    # Send bottom half of cross neigbhor right
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(cross_id * size + half_size, half_size)],
+        dst_ref=vmem1.at[pl.ds(cross_id * size + half_size, half_size)],
+        dst_device_id=right_id,
+        src_send_sem=right_send_sems.at[0],
+        dst_recv_sem=left_recv_sems.at[0]
+    )
 
-    # PROLOGUE: Initial sends
+    # Send top half of cross neighbor left
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(cross_id * size, half_size)],
+        dst_ref=vmem1.at[pl.ds(cross_id * size, half_size)],
+        dst_device_id=left_id,
+        src_send_sem=left_send_sems.at[0],
+        dst_recv_sem=right_recv_sems.at[0]
+    )
 
-    for shard in range(NUM_SHARDS):
-        # Top shard sent left
-        pallas_rdma_start(
-            src_ref=x_ref.at[pl.ds(schedule[0][0] + shard * shard_size, shard_size)],
-            dst_ref=vmem.at[pl.ds(schedule[0][0] + shard * shard_size, shard_size)],
-            dst_device_id=left_id,
-            src_send_sem=left_send_sems[shard].at[0],
-            dst_recv_sem=right_recv_sems[shard].at[0]
-        )
+    # Send bottom half of left neighbor left
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(left_id * size + half_size, half_size)],
+        dst_ref=vmem1.at[pl.ds(left_id * size + half_size, half_size)],
+        dst_device_id=left_id,
+        src_send_sem=left_send_sems.at[1],
+        dst_recv_sem=right_recv_sems.at[1]
+    )
+    
+    # Send top half of right neighbor right
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(right_id * size, half_size)],
+        dst_ref=vmem1.at[pl.ds(right_id * size, half_size)],
+        dst_device_id=right_id,
+        src_send_sem=right_send_sems.at[1],
+        dst_recv_sem=left_recv_sems.at[1]
+    )
 
-        # Bottom shard sent right
-        pallas_rdma_start(
-            src_ref=x_ref.at[pl.ds(schedule[0][1] + shard * shard_size, shard_size)],
-            dst_ref=vmem.at[pl.ds(schedule[0][1] + shard * shard_size, shard_size)],
-            dst_device_id=right_id,
-            src_send_sem=right_send_sems[shard].at[0],
-            dst_recv_sem=left_recv_sems[shard].at[0]
-        )
+    # Wait for top half of left neighbor
+    pallas_rdma_wait_recv(
+        dst_ref=vmem1.at[pl.ds(left_id * size, half_size)],
+        dst_recv_sem=right_recv_sems.at[0]
+    )
 
-    for i in range(1, len(schedule)):
+    # Wait for bottom half of right neighbor
+    pallas_rdma_wait_recv(
+        dst_ref=vmem1.at[pl.ds(right_id * size + half_size, half_size)],
+        dst_recv_sem=left_recv_sems.at[0]
+    )
 
-        # Inner shard loop
-        for shard in range(NUM_SHARDS):
-            # Wait for shard traveling left
-            pallas_rdma_wait_recv(
-                dst_ref=vmem.at[pl.ds(schedule[i][0] + shard * shard_size, shard_size)],
-                dst_recv_sem=right_recv_sems[shard].at[i-1]
-            )
+    # Accumulate and Send
+    x_ref[pl.ds(left_id * size, half_size)] = x_ref[pl.ds(left_id * size, half_size)] + vmem1[pl.ds(left_id * size, half_size)]
 
-            # Wait for shard traveling right
-            pallas_rdma_wait_recv(
-                dst_ref=vmem.at[pl.ds(schedule[i][1] + shard * shard_size, shard_size)],
-                dst_recv_sem=left_recv_sems[shard].at[i-1]
-            )
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(left_id * size, half_size)],
+        dst_ref=vmem2.at[pl.ds(left_id * size, half_size)],
+        dst_device_id=left_id,
+        src_send_sem=left_send_sems.at[2],
+        dst_recv_sem=right_recv_sems.at[2]
+    )
+    
+    x_ref[pl.ds(right_id * size + half_size, half_size)] = x_ref[pl.ds(right_id * size + half_size, half_size)] + vmem1[pl.ds(right_id * size + half_size, half_size)]
 
-            # Accumulate left shard
-            x_ref[pl.ds(schedule[i][0] + shard * shard_size, shard_size)] = (
-                x_ref[pl.ds(schedule[i][0] + shard * shard_size, shard_size)] 
-                + vmem[pl.ds(schedule[i][0] + shard * shard_size, shard_size)]
-            )
+    pallas_rdma_start(
+        src_ref=x_ref.at[pl.ds(right_id * size + half_size, half_size)],
+        dst_ref=vmem2.at[pl.ds(right_id * size + half_size, half_size)],
+        dst_device_id=right_id,
+        src_send_sem=right_send_sems.at[2],
+        dst_recv_sem=left_recv_sems.at[2]
+    )
+    
+    # Wait for halves belonging to core_id 
+    pallas_rdma_wait_recv(
+        dst_ref=vmem1.at[pl.ds(core_id * size, half_size)],
+        dst_recv_sem=left_recv_sems.at[1]
+    )
 
-            # Accumulate right shard
-            x_ref[pl.ds(schedule[i][1] + shard * shard_size, shard_size)] = (
-                x_ref[pl.ds(schedule[i][1] + shard * shard_size, shard_size)]
-                + vmem[pl.ds(schedule[i][1] + shard * shard_size, shard_size)]
-            )
-        
-            if i == len(schedule) - 1:
-                # Top shard sent left
-                pallas_rdma_start(
-                    src_ref=x_ref.at[pl.ds(schedule[i][0] + shard * shard_size, shard_size)],
-                    dst_ref=out_ref.at[pl.ds(shard * shard_size, shard_size)],
-                    dst_device_id=left_id,
-                    src_send_sem=left_send_sems[shard].at[i],
-                    dst_recv_sem=right_recv_sems[shard].at[i]
-                )
+    pallas_rdma_wait_recv(
+        dst_ref=vmem1.at[pl.ds(core_id * size + half_size, half_size)],
+        dst_recv_sem=right_recv_sems.at[1]
+    )
 
-                # Bottom shard sent right
-                pallas_rdma_start(
-                    src_ref=x_ref.at[pl.ds(schedule[i][1] + shard * shard_size, shard_size)],
-                    dst_ref=out_ref.at[pl.ds(half_size + shard * shard_size, shard_size)],
-                    dst_device_id=right_id,
-                    src_send_sem=right_send_sems[shard].at[i],
-                    dst_recv_sem=left_recv_sems[shard].at[i]
-                )
-            else:
+    pallas_rdma_wait_recv(
+        dst_ref=vmem2.at[pl.ds(core_id * size, half_size)],
+        dst_recv_sem=right_recv_sems.at[2]
+    )
 
-                # Top shard sent left
-                pallas_rdma_start(
-                    src_ref=x_ref.at[pl.ds(schedule[i][0] + shard * shard_size, shard_size)],
-                    dst_ref=vmem.at[pl.ds(schedule[i][0] + shard * shard_size, shard_size)],
-                    dst_device_id=left_id,
-                    src_send_sem=left_send_sems[shard].at[i],
-                    dst_recv_sem=right_recv_sems[shard].at[i]
-                )
+    pallas_rdma_wait_recv(
+        dst_ref=vmem2.at[pl.ds(core_id * size + half_size, half_size)],
+        dst_recv_sem=left_recv_sems.at[2]
+    )
 
-                # Bottom shard sent right
-                pallas_rdma_start(
-                    src_ref=x_ref.at[pl.ds(schedule[i][1] + shard * shard_size, shard_size)],
-                    dst_ref=vmem.at[pl.ds(schedule[i][1] + shard * shard_size, shard_size)],
-                    dst_device_id=right_id,
-                    src_send_sem=right_send_sems[shard].at[i],
-                    dst_recv_sem=left_recv_sems[shard].at[i]
-                )
+    # Accumulate
+    out_ref[pl.ds(0, size)] = (
+        x_ref[pl.ds(core_id * size, size)] + 
+        vmem1[pl.ds(core_id * size, size)] +
+        vmem2[pl.ds(core_id * size, size)]
+    )
 
-    # All wait_sends
-    for i, addrs in enumerate(schedule):
+    # Final wait sends
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(cross_id * size + half_size, half_size)],
+        src_send_sem=right_send_sems.at[0]
+    )
 
-        addr1, addr2 = addrs
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(cross_id * size, half_size)],
+        src_send_sem=left_send_sems.at[0]
+    )
 
-        for shard in range(NUM_SHARDS):
-            pallas_rdma_wait_send(
-                src_ref=x_ref.at[pl.ds(addr1 + shard * shard_size, shard_size)],
-                src_send_sem=left_send_sems[shard].at[i]
-            )
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(left_id * size + half_size, half_size)],
+        src_send_sem=left_send_sems.at[1]
+    )
 
-            pallas_rdma_wait_send(
-                src_ref=x_ref.at[pl.ds(addr2 + shard * shard_size, shard_size)],
-                src_send_sem=right_send_sems[shard].at[i]
-            )
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(right_id * size, half_size)],
+        src_send_sem=right_send_sems.at[1]
+    )
 
-    # EPILOGUE: final wait
-    for shard in range(NUM_SHARDS):
-        # Wait for shard traveling left
-        pallas_rdma_wait_recv(
-            dst_ref=out_ref.at[pl.ds(shard * shard_size, shard_size)],
-            dst_recv_sem=right_recv_sems[shard].at[len(schedule)-1]
-        )
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(left_id * size, half_size)],
+        src_send_sem=left_send_sems.at[2]
+    )
 
-        # Wait for shard traveling right
-        pallas_rdma_wait_recv(
-            dst_ref=out_ref.at[pl.ds(half_size + shard * shard_size, shard_size)],
-            dst_recv_sem=left_recv_sems[shard].at[len(schedule)-1]
-        )
+    pallas_rdma_wait_send(
+        src_ref=x_ref.at[pl.ds(right_id * size + half_size, half_size)],
+        src_send_sem=right_send_sems.at[2]
+    )
 
 
 def all_gather_pallas_scratch_specs(x):
