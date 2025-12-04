@@ -191,6 +191,18 @@ def matmul_pallas_kernel(x_ref, w_ref, out_ref, scratch_refs):
     )
 
 
+def matmul_helper(x_ref, w_ref):
+
+    N_BATCH = x_ref.shape[0]
+    M = x_ref.shape[1]
+    N = w_ref.shape[1]
+
+    return jnp.astype(
+        pl.dot(x_ref[pl.ds(0, N_BATCH), pl.ds(0, M)], 
+               w_ref[pl.ds(0, M), pl.ds(0, N)]),
+        jnp.bfloat16
+    )
+
 def all_gather_matmul_pallas_scratch_specs(x):
 
     return {
@@ -268,7 +280,10 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
     )
 
     # Immediately place x_ref matmul in output
-    vmem[pl.ds(0, size), pl.ds(core_id*dim2, dim2)] = x_ref[pl.ds(0, size), pl.ds(0, dim2)]
+    out_ref[pl.ds(0, size), pl.ds(0, w1_ref.shape[1])] = matmul_helper(
+        x_ref.at[pl.ds(0, size), pl.ds(0, dim2)], 
+        w1_ref.at[pl.ds(dim2 * core_id, dim2), pl.ds(0, w1_ref.shape[1])],
+    )
 
     # Wait for right neighbor top half data
     pallas_rdma_wait_recv(
@@ -300,11 +315,7 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
         dst_recv_sem=recv_sems.at[3]
     )
 
-    # Execute all waits
-
-    non_adjacent_neighbor = (right_neighbor + 1) % 4
-
-
+    # Wait for full left and right neigbor data and matmul accumulate
     pallas_rdma_wait_recv(
         dst_ref=vmem.at[pl.ds(half_size, half_size), pl.ds(right_neighbor*dim2, dim2)],
         dst_recv_sem=recv_sems.at[4]
@@ -315,6 +326,18 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
         dst_recv_sem=recv_sems.at[5]
     )
 
+    out_ref[pl.ds(0, size), pl.ds(0, w1_ref.shape[1])] += matmul_helper(
+        vmem.at[pl.ds(0, size), pl.ds(left_neighbor*dim2, dim2)], 
+        w1_ref.at[pl.ds(dim2 * left_neighbor, dim2), pl.ds(0, w1_ref.shape[1])],
+    )
+
+    out_ref[pl.ds(0, size), pl.ds(0, w1_ref.shape[1])] += matmul_helper(
+        vmem.at[pl.ds(0, size), pl.ds(right_neighbor*dim2, dim2)], 
+        w1_ref.at[pl.ds(dim2 * right_neighbor, dim2), pl.ds(0, w1_ref.shape[1])],
+    )
+
+    # Wait for full non adjacent neighbor data and matmul accumulate
+    non_adjacent_neighbor = (right_neighbor + 1) % 4
     pallas_rdma_wait_recv(
         dst_ref=vmem.at[pl.ds(0, half_size), pl.ds(non_adjacent_neighbor*dim2, dim2)],
         dst_recv_sem=recv_sems.at[2]
@@ -325,10 +348,9 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
         dst_recv_sem=recv_sems.at[3]
     )
 
-    out_ref[pl.ds(0, out_ref.shape[0]), pl.ds(0, out_ref.shape[1])] = jnp.astype(
-        pl.dot(vmem[pl.ds(0, vmem.shape[0]), pl.ds(0, vmem.shape[1])], 
-               w1_ref[pl.ds(0, w1_ref.shape[0]), pl.ds(0, w1_ref.shape[1])]),
-        jnp.bfloat16
+    out_ref[pl.ds(0, size), pl.ds(0, w1_ref.shape[1])] += matmul_helper(
+        vmem.at[pl.ds(0, size), pl.ds(non_adjacent_neighbor*dim2, dim2)], 
+        w1_ref.at[pl.ds(dim2 * non_adjacent_neighbor, dim2), pl.ds(0, w1_ref.shape[1])],
     )
 
     pallas_rdma_wait_send(
