@@ -431,8 +431,8 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
     vmem2 = scratch_refs["vmem2"]
 
     # Initial Matmmul on cross neighbor block
-    vmem0[pl.ds(0, size), pl.ds(cross_id * dim2, dim2)] = matmul_helper(
-        x_ref.at[pl.ds(0, size), pl.ds(0, K2)],
+    vmem0[pl.ds(half_size, half_size), pl.ds(cross_id * dim2, dim2)] = matmul_helper(
+        x_ref.at[pl.ds(half_size, half_size), pl.ds(0, K2)],
         w2_ref.at[pl.ds(0, K2), pl.ds(cross_id * dim2, dim2)]
     )
 
@@ -445,6 +445,11 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
         dst_recv_sem=left_recv_sems.at[0]
     )
 
+    vmem0[pl.ds(0, half_size), pl.ds(cross_id * dim2, dim2)] = matmul_helper(
+        x_ref.at[pl.ds(0, half_size), pl.ds(0, K2)],
+        w2_ref.at[pl.ds(0, K2), pl.ds(cross_id * dim2, dim2)]
+    )
+
     # Send top half of cross neighbor left
     pallas_rdma_start(
         src_ref=vmem0.at[pl.ds(0, half_size), pl.ds(cross_id * dim2, dim2)],
@@ -454,9 +459,9 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
         dst_recv_sem=right_recv_sems.at[0]
     )
 
-    # Initial Matmmul on left neighbor block
-    vmem0[pl.ds(0, size), pl.ds(left_id * dim2, dim2)] = matmul_helper(
-        x_ref.at[pl.ds(0, size), pl.ds(0, K2)],
+    # Initial Matmmul on left neighbor bottom half
+    vmem0[pl.ds(half_size, half_size), pl.ds(left_id * dim2, dim2)] = matmul_helper(
+        x_ref.at[pl.ds(half_size, half_size), pl.ds(0, K2)],
         w2_ref.at[pl.ds(0, K2), pl.ds(left_id * dim2, dim2)]
     )
 
@@ -469,9 +474,9 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
         dst_recv_sem=right_recv_sems.at[1]
     )
 
-    # Initial Matmmul on right neighbor block
-    vmem0[pl.ds(0, size), pl.ds(right_id * dim2, dim2)] = matmul_helper(
-        x_ref.at[pl.ds(0, size), pl.ds(0, K2)],
+    # Initial Matmmul on right neighbor top half
+    vmem0[pl.ds(0, half_size), pl.ds(right_id * dim2, dim2)] = matmul_helper(
+        x_ref.at[pl.ds(0, half_size), pl.ds(0, K2)],
         w2_ref.at[pl.ds(0, K2), pl.ds(right_id * dim2, dim2)]
     )
     
@@ -488,6 +493,18 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
     vmem0[pl.ds(0, size), pl.ds(core_id * dim2, dim2)] = matmul_helper(
         x_ref.at[pl.ds(0, size), pl.ds(0, K2)],
         w2_ref.at[pl.ds(0, K2), pl.ds(core_id * dim2, dim2)]
+    )
+
+    # Initial Matmmul on left neighbor top half
+    vmem0[pl.ds(0, half_size), pl.ds(left_id * dim2, dim2)] = matmul_helper(
+        x_ref.at[pl.ds(0, half_size), pl.ds(0, K2)],
+        w2_ref.at[pl.ds(0, K2), pl.ds(left_id * dim2, dim2)]
+    )
+
+    # Initial Matmmul on right neighbor bottom half
+    vmem0[pl.ds(half_size, half_size), pl.ds(right_id * dim2, dim2)] = matmul_helper(
+        x_ref.at[pl.ds(half_size, half_size), pl.ds(0, K2)],
+        w2_ref.at[pl.ds(0, K2), pl.ds(right_id * dim2, dim2)]
     )
 
     # Wait for top half of left neighbor
