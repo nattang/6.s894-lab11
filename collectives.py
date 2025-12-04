@@ -234,7 +234,7 @@ def exchange_with_neighbor_pallas_kernel(x_ref, out_ref, scratch_refs):
         dst_recv_sem=recv_sems
     )
 
-NUM_SHARDS = 1
+
 def reduce_scatter_pallas_scratch_specs(x):
     """
     Arguments:

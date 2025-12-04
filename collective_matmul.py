@@ -386,8 +386,15 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
 
 
 def matmul_reduce_scatter_pallas_scratch_specs(x):
+
     return {
-        # TODO: your code here
+        "vmem0" : pltpu.VMEM(shape=(x.shape[0], K1), dtype=jnp.bfloat16),
+        "vmem1" : pltpu.VMEM(shape=(x.shape[0], K1), dtype=jnp.bfloat16),
+        "vmem2" : pltpu.VMEM(shape=(x.shape[0], K1), dtype=jnp.bfloat16),
+        "left_send_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
+        "right_send_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
+        "left_recv_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
+        "right_recv_sems" : pltpu.SemaphoreType.DMA(shape=(3,)),
     }
 
 
@@ -401,8 +408,167 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
     * out_ref: [N_BATCH, K1 / N_DEVICES]
     """
 
-    # TODO: your code here
-    pass
+    # Get ID's
+    core_id = pallas_get_my_device_id()
+    left_id = (core_id - 1) % 4
+    right_id = (core_id + 1) % 4
+    cross_id = (core_id + 2) % 4
+
+    # Get shape
+    size = out_ref.shape[0]
+    half_size = size // 2
+    dim2 = K1 // 4
+
+    # Get Semaphores
+    left_send_sems = scratch_refs["left_send_sems"]
+    right_send_sems = scratch_refs["right_send_sems"]
+    left_recv_sems = scratch_refs["left_recv_sems"]
+    right_recv_sems = scratch_refs["right_recv_sems"]
+
+    # Get VMEM
+    vmem0 = scratch_refs["vmem0"]
+    vmem1 = scratch_refs["vmem1"]
+    vmem2 = scratch_refs["vmem2"]
+
+    # Initial Matmmul
+    vmem0[pl.ds(0, size), pl.ds(0, K1)] = matmul_helper(
+        x_ref.at[pl.ds(0, size), pl.ds(0, K2)],
+        w2_ref.at[pl.ds(0, K2), pl.ds(0, K1)]
+    )
+
+    # Send bottom half of cross neigbhor right
+    pallas_rdma_start(
+        src_ref=vmem0.at[pl.ds(half_size, half_size), pl.ds(cross_id * dim2, dim2)],
+        dst_ref=vmem1.at[pl.ds(half_size, half_size), pl.ds(cross_id * dim2, dim2)],
+        dst_device_id=right_id,
+        src_send_sem=right_send_sems.at[0],
+        dst_recv_sem=left_recv_sems.at[0]
+    )
+
+    # Send top half of cross neighbor left
+    pallas_rdma_start(
+        src_ref=vmem0.at[pl.ds(0, half_size), pl.ds(cross_id * dim2, dim2)],
+        dst_ref=vmem1.at[pl.ds(0, half_size), pl.ds(cross_id * dim2, dim2)], 
+        dst_device_id=left_id,
+        src_send_sem=left_send_sems.at[0],
+        dst_recv_sem=right_recv_sems.at[0]
+    )
+
+    # Send bottom half of left neighbor left
+    pallas_rdma_start(
+        src_ref=vmem0.at[pl.ds(half_size, half_size), pl.ds(left_id * dim2, dim2)],
+        dst_ref=vmem1.at[pl.ds(half_size, half_size), pl.ds(left_id * dim2, dim2)],
+        dst_device_id=left_id,
+        src_send_sem=left_send_sems.at[1],
+        dst_recv_sem=right_recv_sems.at[1]
+    )
+    
+    # Send top half of right neighbor right
+    pallas_rdma_start(
+        src_ref=vmem0.at[pl.ds(0, half_size), pl.ds(right_id * dim2, dim2)],
+        dst_ref=vmem1.at[pl.ds(0, half_size), pl.ds(right_id * dim2, dim2)],
+        dst_device_id=right_id,
+        src_send_sem=right_send_sems.at[1],
+        dst_recv_sem=left_recv_sems.at[1]
+    )
+
+    # Wait for top half of left neighbor
+    pallas_rdma_wait_recv(
+        dst_ref=vmem1.at[pl.ds(0, half_size), pl.ds(left_id * dim2, dim2)],
+        dst_recv_sem=right_recv_sems.at[0]
+    )
+
+    # Wait for bottom half of right neighbor
+    pallas_rdma_wait_recv(
+        dst_ref=vmem1.at[pl.ds(half_size, half_size), pl.ds(right_id * dim2, dim2)],
+        dst_recv_sem=left_recv_sems.at[0]
+    )
+
+    # Accumulate and Send
+    vmem1[pl.ds(0, half_size), pl.ds(left_id * dim2, dim2)] = (
+        vmem0[pl.ds(0, half_size), pl.ds(left_id * dim2, dim2)] +
+        vmem1[pl.ds(0, half_size), pl.ds(left_id * dim2, dim2)]
+    )
+
+    pallas_rdma_start(
+        src_ref=vmem1.at[pl.ds(0, half_size), pl.ds(left_id * dim2, dim2)],
+        dst_ref=vmem2.at[pl.ds(0, half_size), pl.ds(left_id * dim2, dim2)],
+        dst_device_id=left_id,
+        src_send_sem=left_send_sems.at[2],
+        dst_recv_sem=right_recv_sems.at[2]
+    )
+    
+    vmem1[pl.ds(half_size, half_size), pl.ds(right_id * dim2, dim2)] = (
+        vmem0[pl.ds(half_size, half_size), pl.ds(right_id * dim2, dim2)] +
+        vmem1[pl.ds(half_size, half_size), pl.ds(right_id * dim2, dim2)]
+    )
+
+    pallas_rdma_start(
+        src_ref=vmem1.at[pl.ds(half_size, half_size), pl.ds(right_id * dim2, dim2)],
+        dst_ref=vmem2.at[pl.ds(half_size, half_size), pl.ds(right_id * dim2, dim2)],
+        dst_device_id=right_id,
+        src_send_sem=right_send_sems.at[2],
+        dst_recv_sem=left_recv_sems.at[2]
+    )
+    
+    # Wait for halves belonging to core_id 
+    pallas_rdma_wait_recv(
+        dst_ref=vmem1.at[pl.ds(0, half_size), pl.ds(core_id * dim2, dim2)],
+        dst_recv_sem=left_recv_sems.at[1]
+    )
+
+    pallas_rdma_wait_recv(
+        dst_ref=vmem1.at[pl.ds(half_size, half_size), pl.ds(core_id * dim2, dim2)],
+        dst_recv_sem=right_recv_sems.at[1]
+    )
+
+    pallas_rdma_wait_recv(
+        dst_ref=vmem2.at[pl.ds(0, half_size), pl.ds(core_id * dim2, dim2)],
+        dst_recv_sem=right_recv_sems.at[2]
+    )
+
+    pallas_rdma_wait_recv(
+        dst_ref=vmem2.at[pl.ds(half_size, half_size), pl.ds(core_id * dim2, dim2)],
+        dst_recv_sem=left_recv_sems.at[2]
+    )
+
+    # Accumulate
+    out_ref[pl.ds(0, size), pl.ds(0, dim2)] = (
+        vmem0[pl.ds(0, size), pl.ds(core_id * dim2, dim2)] + 
+        vmem1[pl.ds(0, size), pl.ds(core_id * dim2, dim2)] +
+        vmem2[pl.ds(0, size), pl.ds(core_id * dim2, dim2)]
+    )
+
+    # Final wait sends
+    pallas_rdma_wait_send(
+        src_ref=vmem0.at[pl.ds(half_size, half_size), pl.ds(cross_id * dim2, dim2)],
+        src_send_sem=right_send_sems.at[0]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=vmem0.at[pl.ds(0, half_size), pl.ds(cross_id * dim2, dim2)],
+        src_send_sem=left_send_sems.at[0]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=vmem0.at[pl.ds(half_size, half_size), pl.ds(left_id * dim2, dim2)],
+        src_send_sem=left_send_sems.at[1]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=vmem0.at[pl.ds(0, half_size), pl.ds(right_id * dim2, dim2)],
+        src_send_sem=right_send_sems.at[1]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=vmem1.at[pl.ds(0, half_size), pl.ds(left_id * dim2, dim2)],
+        src_send_sem=left_send_sems.at[2]
+    )
+
+    pallas_rdma_wait_send(
+        src_ref=vmem1.at[pl.ds(half_size, half_size), pl.ds(right_id * dim2, dim2)],
+        src_send_sem=right_send_sems.at[2]
+    )
 
 
 def neural_network_pallas_scratch_specs(x, w1_refs, w2_refs):
