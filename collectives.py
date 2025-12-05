@@ -903,7 +903,7 @@ def run_scenario(
 
             if rel_rmse > 1e-7:
                 print("    kernel output is incorrect; skipping benchmarking")
-                continue
+                return
 
             @jax.jit
             @jax.shard_map(
