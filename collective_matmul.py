@@ -489,12 +489,6 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
         dst_recv_sem=left_recv_sems.at[1]
     )
 
-    # Initial Matmmul on core's block
-    vmem0[pl.ds(0, size), pl.ds(core_id * dim2, dim2)] = matmul_helper(
-        x_ref.at[pl.ds(0, size), pl.ds(0, K2)],
-        w2_ref.at[pl.ds(0, K2), pl.ds(core_id * dim2, dim2)]
-    )
-
     # Initial Matmmul on left neighbor top half
     vmem0[pl.ds(0, half_size), pl.ds(left_id * dim2, dim2)] = matmul_helper(
         x_ref.at[pl.ds(0, half_size), pl.ds(0, K2)],
@@ -544,6 +538,12 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
         dst_device_id=right_id,
         src_send_sem=right_send_sems.at[2],
         dst_recv_sem=left_recv_sems.at[2]
+    )
+    
+    # Initial Matmmul on core's block
+    vmem0[pl.ds(0, size), pl.ds(core_id * dim2, dim2)] = matmul_helper(
+        x_ref.at[pl.ds(0, size), pl.ds(0, K2)],
+        w2_ref.at[pl.ds(0, K2), pl.ds(core_id * dim2, dim2)]
     )
     
     # Wait for halves belonging to core_id 
